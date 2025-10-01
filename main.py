@@ -39,6 +39,8 @@ def get_log_dir(args):
     return f"{args.log_root}/{args.exp_name}/{folder}"
 
 
+# python main.py --input_path="media/images/anime-1_2k.png" --exp_name="results/test/anime-1_2k" --num_gaussians=10000 --quantize
+
 def main(args):
     args.log_dir = get_log_dir(args)
     ImageGS = GaussianSplatting2D(args)
