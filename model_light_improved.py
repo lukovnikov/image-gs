@@ -2,7 +2,8 @@ import logging
 import math
 import os
 import sys
-from time import perf_counter
+from time import perf_counter, time
+import cv2
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from fused_ssim import fused_ssim
 from lpips import LPIPS
 from pytorch_msssim import MS_SSIM
 from torchvision.transforms.functional import gaussian_blur, to_pil_image
+from poissonDiskSampling import poissonDiskSampling
 
 from gsplat import (
     project_gaussians_2d_scale_rot,
@@ -32,6 +34,135 @@ from utils.image_utils import (
 from utils.misc_utils import clean_dir, get_latest_ckpt_step, save_cfg, set_random_seed
 from utils.quantization_utils import ste_quantize
 from utils.saliency_utils import get_smap
+
+import scipy.ndimage as ndi
+
+
+def _vispoints(points, img_h, img_w, filename="vispoints.png"):
+    vis = np.zeros((img_h, img_w))
+    for p in points:
+        y, x = round(p[0]), round(p[1])
+        vis[x, y] = 1.0
+    to_pil_image(vis).save(filename)
+    return vis
+
+
+def generate_hex_grid(width, height, hex_size):
+    hstep = hex_size
+    vstep = 0.8660 * hstep
+    points = []
+    x, y = hstep/2, 0
+    points.append((x, y))
+    prevstartx = x
+    while True:
+        x += hstep
+        if x >= width:
+            y += vstep
+            x = hstep/2 if prevstartx == 0 else 0
+            prevstartx = x
+        if y >= height:
+            break
+        points.append((x, y))
+    return np.array(points)
+
+    width_spacing = hex_size * 1.5
+    height_spacing = hex_size * np.sqrt(3)
+    
+    q_range = np.arange(-1, int(width / width_spacing) + 2)
+    r_range = np.arange(-1, int(height / height_spacing) + 2)
+    
+    Q, R = np.meshgrid(q_range, r_range)
+    
+    X = hex_size * 1.5 * Q
+    Y = hex_size * np.sqrt(3) * (R + Q/2)
+    
+    valid_mask = (X >= 0) & (X <= width) & (Y >= 0) & (Y <= height)
+    points = np.column_stack([X[valid_mask], Y[valid_mask]])
+
+    return points
+
+
+def smooth_gradients(image, sigma=1.0, rgb_method='magnitude'):
+    """
+    Compute smooth gradients using Gaussian derivatives.
+    
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Input image. Can be:
+        - 2D grayscale: shape (height, width)
+        - 3D RGB: shape (height, width, 3)
+    sigma : float
+        Standard deviation for Gaussian kernel
+    rgb_method : str
+        How to handle RGB images:
+        - 'luminance': Convert to grayscale using luminance weights
+        - 'per_channel': Compute gradients for each channel separately
+        - 'magnitude': Compute per-channel gradients, then combine magnitudes
+    """
+    
+    if len(image.shape) == 2:
+        # Grayscale image - direct computation
+        grad_x = ndi.gaussian_filter(image, sigma=sigma, order=[0, 1])
+        grad_y = ndi.gaussian_filter(image, sigma=sigma, order=[1, 0])
+        
+        magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        direction = np.arctan2(grad_y, grad_x)
+        
+        return magnitude, direction, grad_x, grad_y
+    
+    elif len(image.shape) == 3:
+        # image = image.transpose((1, 2, 0))
+        # RGB image - multiple handling options
+        if rgb_method == 'luminance':
+            # Convert to grayscale using standard luminance weights
+            gray = 0.299 * image[:,:,0] + 0.587 * image[:,:,1] + 0.114 * image[:,:,2]
+            
+            grad_x = ndi.gaussian_filter(gray, sigma=sigma, order=[0, 1])
+            grad_y = ndi.gaussian_filter(gray, sigma=sigma, order=[1, 0])
+            
+            magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            direction = np.arctan2(grad_y, grad_x)
+            
+            return magnitude, direction, grad_x, grad_y
+            
+        elif rgb_method == 'per_channel':
+            # Compute gradients for each channel separately
+            results = []
+            for channel in range(image.shape[2]):
+                grad_x = ndi.gaussian_filter(image[:,:,channel], sigma=sigma, order=[0, 1])
+                grad_y = ndi.gaussian_filter(image[:,:,channel], sigma=sigma, order=[1, 0])
+                
+                magnitude = np.sqrt(grad_x**2 + grad_y**2)
+                direction = np.arctan2(grad_y, grad_x)
+                
+                results.append((magnitude, direction, grad_x, grad_y))
+            
+            return results  # List of (magnitude, direction, grad_x, grad_y) for each channel
+            
+        elif rgb_method == 'magnitude':
+            # Compute per-channel gradients, then combine magnitudes
+            total_magnitude = np.zeros(image.shape[:2])
+            
+            for channel in range(image.shape[2]):
+                grad_x = ndi.gaussian_filter(image[:,:,channel], sigma=sigma, order=[0, 1])
+                grad_y = ndi.gaussian_filter(image[:,:,channel], sigma=sigma, order=[1, 0])
+                
+                channel_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+                total_magnitude += channel_magnitude**2
+            
+            combined_magnitude = np.sqrt(total_magnitude)
+            
+            # For direction, use luminance-based gradients
+            gray = 0.299 * image[:,:,0] + 0.587 * image[:,:,1] + 0.114 * image[:,:,2]
+            grad_x_gray = ndi.gaussian_filter(gray, sigma=sigma, order=[0, 1])
+            grad_y_gray = ndi.gaussian_filter(gray, sigma=sigma, order=[1, 0])
+            direction = np.arctan2(grad_y_gray, grad_x_gray)
+            
+            return combined_magnitude, direction, grad_x_gray, grad_y_gray
+    
+    else:
+        raise ValueError("Image must be 2D or 3D array")
 
 
 class GSImage(torch.nn.Module):
@@ -140,21 +271,59 @@ class GaussianSplatting2D(nn.Module):
         num_pixels = img_h * img_w
         num_gaussians = xy.shape[0]
         with torch.no_grad():
-            # Position
+            # Position.  # TODO: we need to initialize not right ON the gradient, but right next to it (so gradient of gradient)
             if self.init_mode == 'gradient':
                 gradients = self._compute_gmap(gt_images)
+                g_norm = gradients.reshape(-1)
+                gradients = g_norm / g_norm.sum()
                 xy.copy_(self._sample_pos(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
+                scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
+            elif self.init_mode == 'gradientnew':
+                gradients = self._compute_gmap(gt_images)
+                # gradients = (gradients + 1.2).clip(0., 1.)      # ensure low-density regions are not completely ignored
+                g_norm = gradients.reshape(-1)
+                gradients = g_norm / g_norm.sum()
+                xy.copy_(self._sample_pos_new(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians, img_w=img_w, img_h=img_h))
+                radii = self._get_radii(xy) * (img_h + img_w) / 2
+                scale.copy_(radii if self.disable_inverse_scale else 1.0 / radii)
+            elif self.init_mode == "gradientpoisson":
+                gradients = self._compute_gmap(gt_images)
+                gradient_norm = (gradients - gradients.min()) / (gradients.max() - gradients.min())
+                min_radius, max_radius = 0.5, 4.0                  # TODO: put in config
+                radius_map = max_radius - (max_radius - min_radius) * gradient_norm
+                # time it
+                start_time = time()
+                print("started sampler")
+                nParticle, particleCoordinates = poissonDiskSampling(
+                    radius_map, 
+                    k=30,  # Number of candidates per iteration
+                    radiusType='default'
+                )
+                print(f"sampler took {time() - start_time:.2f} seconds, sampled {nParticle} points")
+                print("done sampling")
+                raise NotImplementedError()
+                # xy.copy_(self._sample_pos(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
             elif self.init_mode == 'saliency':
                 saliency = self._compute_smap(gt_images, path="models")
                 xy.copy_(self._sample_pos(prob=saliency, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
+                scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
             else:
                 selected = np.random.choice(num_pixels, num_gaussians, replace=False, p=None)
                 xy.copy_(pixel_xy.detach().clone()[selected])
-            # Scale     # TODO: allow non-uniform scale initialization based on distances between points (in xy)
-            scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
+                scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
             # Feature
             feat.copy_(self._get_target_features(gt_images=gt_images, positions=xy).detach().clone())
         return gsimage
+    
+    def _get_radii(self, xy, k_neighbours=5, overlap_factor=0.25):
+        distances = torch.cdist(xy, xy, p=2)  # Shape: [L, L]
+        k_plus_one = min(k_neighbours + 1, len(xy))
+        nearest_dists, nearest_indices = torch.topk(distances, k_plus_one, dim=1, largest=False)
+        avg_neighbour_dists = nearest_dists[:, 1:k_plus_one].mean(dim=1)  # Exclude the first one (distance to itself)neighbor_dists = nearest_dists[:, 1:k_plus_one]  # Shape: [L, k]    
+        adaptive_variance = (avg_neighbour_dists * overlap_factor)
+        adaptive_variance = adaptive_variance.clamp(min=1e-6, max=0.2)
+        ret = adaptive_variance.unsqueeze(1).repeat(1, 2)
+        return ret
 
     def _sample_pos(self, prob, pixel_xy, num_pixels, num_gaussians):
         num_random = round(self.init_random_ratio * num_gaussians)
@@ -162,13 +331,43 @@ class GaussianSplatting2D(nn.Module):
         selected_other = np.random.choice(num_pixels, num_gaussians-num_random, replace=False, p=prob)
         return torch.cat([pixel_xy.detach().clone()[selected_random], pixel_xy.detach().clone()[selected_other]], dim=0)
 
+    def _sample_pos_new(self, prob, pixel_xy, num_pixels, num_gaussians, img_w, img_h):
+        num_uniform_hex = round(self.init_random_ratio * num_gaussians)
+        hsize = np.sqrt(img_h * img_w / (0.8860 * num_uniform_hex))
+        grid_points = generate_hex_grid(img_w, img_h, hsize)
+        grid_points[:, 0] = grid_points[:, 0] / img_h
+        grid_points[:, 1] = grid_points[:, 1] / img_w
+        num_uniform_hex = len(grid_points)
+        # selected_random = np.random.choice(num_pixels, num_uniform_hex, replace=False, p=None)
+        selected_other = np.random.choice(num_pixels, num_gaussians-num_uniform_hex, replace=False, p=prob)
+        density_points = pixel_xy.detach().clone()[selected_other]
+        ret = torch.cat([torch.tensor(grid_points).to(density_points.device).to(density_points.dtype), density_points], dim=0)
+        return ret
+
     def _compute_gmap(self, gt_images):
         gy, gx = compute_image_gradients(np.power(gt_images.detach().cpu().clone().numpy(), 1.0 / self.gamma))
         g_norm = np.hypot(gy, gx).astype(np.float32)
         g_norm = g_norm / g_norm.max()
-        g_norm = np.power(g_norm.reshape(-1), 2.0)
-        image_gradients = g_norm / g_norm.sum()
-        return image_gradients
+        g_norm = np.power(g_norm, 2.0)
+        return g_norm
+
+    def _compute_gmap_new(self, gt_images):
+        gt_images_np = gt_images.detach().cpu().clone().numpy().transpose(1, 2, 0)
+        smooth_g, *_ = smooth_gradients(gt_images_np, sigma=0.5, rgb_method='magnitude')
+        smooth_g = np.power(smooth_g, 0.6)
+        _smooth_g = smooth_g
+        smooth_g = cv2.blur(smooth_g, (5, 5))
+        smooth_g = (smooth_g - smooth_g.min()) / (smooth_g.max() - smooth_g.min())
+        # second_g, *_ = smooth_gradients(smooth_g, sigma=0.99, rgb_method='magnitude')
+        # second_g = np.power(second_g, 1.)
+        # second_g = second_g / second_g.max()
+        # second_g = smooth_g - _smooth_g
+        # second_g = (second_g - second_g.min()) / (second_g.max() - second_g.min()) * 1.2
+        # second_g = np.exp(second_g * 2) - 1
+        # # second_g = np.power(np.clip(np.exp(second_g), 0., 1.), 2.0)
+        # second_g = np.clip(second_g, 0.0, 1.0)
+        smooth_g = np.clip(smooth_g, 0., 1.)
+        return smooth_g
 
     def _compute_smap(self, gt_images, path):
         smap = get_smap(torch.pow(gt_images.detach().clone(), 1.0 / self.gamma), path, self.smap_filter_size)
@@ -276,6 +475,8 @@ class GaussianSplatting2D(nn.Module):
                                     {'params': gsimage.scale, 'lr': self.scale_lr},
                                     {'params': gsimage.rot, 'lr': self.rot_lr},
                                     {'params': gsimage.feat, 'lr': self.feat_lr}])
+        
+        went_beyond_min_steps = False
 
         for step in range(self.start_step, self.max_steps+1):
             optimizer.zero_grad()
@@ -308,6 +509,9 @@ class GaussianSplatting2D(nn.Module):
                                                     {'params': gsimage.scale, 'lr': self.scale_lr},
                                                     {'params': gsimage.rot, 'lr': self.rot_lr},
                                                     {'params': gsimage.feat, 'lr': self.feat_lr}])
+                if step > self.min_steps and not went_beyond_min_steps:
+                    went_beyond_min_steps = True
+                    print("going beyond min steps")
                 if terminate and step >= self.min_steps:
                     break
         recons_images = self.forward(gsimage)[0]
@@ -398,8 +602,15 @@ class GaussianSplatting2D(nn.Module):
         # New Gaussians
         new_xy = pixel_xy.detach().clone()[selected]
         new_scale = torch.ones(add_num, 2, dtype=self.dtype, device=device)
-        init_scale = self.init_scale
-        new_scale.fill_(init_scale if self.disable_inverse_scale else 1.0 / init_scale)
+
+        # # old:
+        # init_scale = self.init_scale
+        # new_scale.fill_(init_scale if self.disable_inverse_scale else 1.0 / init_scale)
+        # new:
+        all_xy = torch.cat([xy, new_xy], dim=0)
+        all_radii = self._get_radii(all_xy, k_neighbours=2) * (img_h + img_w) / 2
+        new_radii = all_radii[-add_num:]
+        new_scale.copy_(new_radii if self.disable_inverse_scale else 1.0 / new_radii)
         new_rot = torch.zeros(add_num, 1, dtype=self.dtype, device=device)
         # new_feat = diff_map.permute(1, 2, 0).reshape(-1, gsimage.feat_dim)[selected]
         new_feat = gt_images.detach().clone().permute(1, 2, 0).reshape(-1, gsimage.feat_dim)[selected]      # initialize color from GT image, not from diff

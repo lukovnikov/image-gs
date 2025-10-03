@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 import fire
 # from model_light import GaussianSplatting2D
-from model_light import GaussianSplatting2D, GSImage
+from model_light_improved import GaussianSplatting2D, GSImage
 from utils.misc_utils import load_cfg
 from PIL import Image
 import json
@@ -98,11 +98,11 @@ class ImageDataset(torch.utils.data.Dataset):
 def encode_directory(path="../miniimagenet_256/",
                      start_idx=0,
                      end_idx=-1,
-                     config="cfgs/default.yaml",
+                     config="cfgs/default_improved.yaml",
                      outdir="miniimagenet_256_out",
                      num_gaussians=4000,
-                     min_steps=3000,
-                     max_steps=8000,
+                     min_steps=700,
+                     max_steps=5000,
                      target_psnr=32,
                      imsize=256,
                      batsize=1,
@@ -154,7 +154,7 @@ def encode_directory(path="../miniimagenet_256/",
         images = images.to(device)
         impath = Path(paths[0][0])
         if not overwrite and (gs_dir / f"{impath.stem}.pt").exists():
-            print("image exists")
+            # print("image exists")
             continue
         gsimage, recons_image, metrics = gs.optimize(images, total_num_gaussians=num_gaussians, target_psnr=target_psnr)
         if save:
