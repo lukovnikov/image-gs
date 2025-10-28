@@ -17,7 +17,6 @@ from poissonDiskSampling import poissonDiskSampling
 
 from gsplat import (
     project_gaussians_2d_scale_rot,
-    project_gaussians_2d_scale_rot_batched,
     rasterize_gaussians_no_tiles,
     rasterize_gaussians_sum,
 )
@@ -166,70 +165,16 @@ def smooth_gradients(image, sigma=1.0, rgb_method='magnitude'):
         raise ValueError("Image must be 2D or 3D array")
 
 
-class GSImageTokenizer:
-    xy_range = (0, 1)
-    scale_range = (0, 1)
-    rot_range = (0, 1)
-    feat_range = (0, 1)
-
-    def __init__(self, num_xy_levels, num_scale_levels, num_rot_levels, num_feat_levels):
-        self.num_xy_levels = num_xy_levels
-        self.num_scale_levels = num_scale_levels
-        self.num_rot_levels = num_rot_levels
-        self.num_feat_levels = num_feat_levels
-
-    def tokenize(self, xy=None, scale=None, rot=None, feat=None):
-        xy_tokens = self._tokenize_xy(xy)
-        scale_tokens = self._tokenize_scale(scale)
-        rot_tokens = self._tokenize_rot(rot)
-        feat_tokens = self._tokenize_feat(feat)
-        tokens = torch.cat([xy_tokens, scale_tokens, rot_tokens, feat_tokens], dim=-1)
-        return tokens
-
-
-class GSImageBase(torch.nn.Module):
-    def pack(self):
-        # flattens xy, scale, rot and feat into a single vector
-        ret = torch.cat([self.xy, self.scale, self.rot, self.feat], -1)
-        return ret
-    
-    def unpack(self, x):
-        xy = x[..., :2]
-        scale = x[..., 2:4]
-        rot = x[..., 4:5]
-        feat = x[..., 5:8]
-        return xy, scale, rot, feat
-
-
-class GSImage(GSImageBase):
-    def __init__(self, num_gaussians, feat_dim, size, dtype, device):
-        super(GSImage, self).__init__()
+class BatchedGSImage(torch.nn.Module):
+    def __init__(self, batch_size, num_gaussians, feat_dim, size, dtype, device):
+        super(BatchedGSImage, self).__init__()
+        self.batch_size = batch_size
+        self.num_gaussians = num_gaussians
         self.feat_dim = feat_dim
         self.dtype = dtype
         self.device = device
         self.img_h, self.img_w = size
         self.register_buffer("size", torch.LongTensor(size))
-        self.xy = nn.Parameter(torch.rand(num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
-        self.scale = nn.Parameter(torch.ones(num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
-        self.rot = nn.Parameter(torch.zeros(num_gaussians, 1, dtype=self.dtype, device=self.device), requires_grad=True)
-        self.feat = nn.Parameter(torch.rand(num_gaussians, self.feat_dim, dtype=self.dtype, device=self.device), requires_grad=True)
-
-    @classmethod
-    def from_statedict(cls, statedict):
-        num_gaussians = statedict['xy'].shape[0]
-        feat_dim = statedict['feat'].shape[1]
-        size = (statedict['size'][0].item(), statedict['size'][1].item())
-        dtype = statedict['xy'].dtype
-        device = statedict['xy'].device
-        gsimage = cls(num_gaussians=num_gaussians, feat_dim=feat_dim, size=size, dtype=dtype, device=device)
-        gsimage.load_state_dict(statedict)
-        return gsimage
-
-
-class BatchedGSImage(GSImage):
-    def __init__(self, batch_size, num_gaussians, feat_dim, size, dtype, device):
-        super(BatchedGSImage, self).__init__(num_gaussians=num_gaussians, feat_dim=feat_dim, size=size, dtype=dtype, device=device)
-        self.batch_size = batch_size
         self.xy = nn.Parameter(torch.rand(self.batch_size, num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
         self.scale = nn.Parameter(torch.ones(self.batch_size, num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
         self.rot = nn.Parameter(torch.zeros(self.batch_size, num_gaussians, 1, dtype=self.dtype, device=self.device), requires_grad=True)
@@ -245,30 +190,6 @@ class BatchedGSImage(GSImage):
         device = statedict['xy'].device
         gsimage = cls(batch_size, num_gaussians=num_gaussians, feat_dim=feat_dim, size=size, dtype=dtype, device=device)
         gsimage.load_state_dict(statedict)
-        return gsimage
-    
-    @staticmethod
-    def from_gsimages(gsimages):
-        batch_size = len(gsimages)
-        num_gaussians = gsimages[0].xy.shape[0]
-        feat_dim = gsimages[0].feat.shape[1]
-        size = (gsimages[0].size[0].item(), gsimages[0].size[1].item())
-        dtype = gsimages[0].xy.dtype
-        device = gsimages[0].xy.device
-        batched_gsimage = BatchedGSImage(batch_size, num_gaussians=num_gaussians, feat_dim=feat_dim, size=size, dtype=dtype, device=device)
-        for i in range(batch_size):
-            batched_gsimage.xy[i].data.copy_(gsimages[i].xy.detach().clone())
-            batched_gsimage.scale[i].data.copy_(gsimages[i].scale.detach().clone())
-            batched_gsimage.rot[i].data.copy_(gsimages[i].rot.detach().clone())
-            batched_gsimage.feat[i].data.copy_(gsimages[i].feat.detach().clone())
-        return batched_gsimage
-
-    def __getitem__(self, idx):
-        gsimage = GSImage(num_gaussians=self.xy.shape[1], feat_dim=self.feat_dim, size=(self.img_h, self.img_w), dtype=self.dtype, device=self.device)
-        gsimage.xy.data.copy_(self.xy[idx].detach().clone())
-        gsimage.scale.data.copy_(self.scale[idx].detach().clone())
-        gsimage.rot.data.copy_(self.rot[idx].detach().clone())
-        gsimage.feat.data.copy_(self.feat[idx].detach().clone())
         return gsimage
 
 
@@ -348,53 +269,54 @@ class GaussianSplatting2D(nn.Module):
 
     def _init_pos_scale_feat(self, gt_images, gsimage):
         img_h, img_w = gt_images.shape[-2:]
-        xy, scale, feat = gsimage.xy, gsimage.scale, gsimage.feat
-        pixel_xy = get_grid(h=img_h, w=img_w).to(dtype=xy.dtype, device=xy.device).reshape(-1, 2)
-        num_pixels = img_h * img_w
-        num_gaussians = xy.shape[0]
-        with torch.no_grad():
-            # Position.  # TODO: we need to initialize not right ON the gradient, but right next to it (so gradient of gradient)
-            if self.init_mode == 'gradient':
-                gradients = self._compute_gmap(gt_images)
-                g_norm = gradients.reshape(-1)
-                gradients = g_norm / g_norm.sum()
-                xy.copy_(self._sample_pos(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
-                scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
-            elif self.init_mode == 'gradientnew':
-                gradients = self._compute_gmap(gt_images)
-                # gradients = (gradients + 1.2).clip(0., 1.)      # ensure low-density regions are not completely ignored
-                g_norm = gradients.reshape(-1)
-                gradients = g_norm / g_norm.sum()
-                xy.copy_(self._sample_pos_new(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians, img_w=img_w, img_h=img_h))
-                radii = self._get_radii(xy) * (img_h + img_w) / 2
-                scale.copy_(radii if self.disable_inverse_scale else 1.0 / radii)
-            elif self.init_mode == "gradientpoisson":
-                gradients = self._compute_gmap(gt_images)
-                gradient_norm = (gradients - gradients.min()) / (gradients.max() - gradients.min())
-                min_radius, max_radius = 0.5, 4.0                  # TODO: put in config
-                radius_map = max_radius - (max_radius - min_radius) * gradient_norm
-                # time it
-                start_time = time()
-                print("started sampler")
-                nParticle, particleCoordinates = poissonDiskSampling(
-                    radius_map, 
-                    k=30,  # Number of candidates per iteration
-                    radiusType='default'
-                )
-                print(f"sampler took {time() - start_time:.2f} seconds, sampled {nParticle} points")
-                print("done sampling")
-                raise NotImplementedError()
-                # xy.copy_(self._sample_pos(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
-            elif self.init_mode == 'saliency':
-                saliency = self._compute_smap(gt_images, path="models")
-                xy.copy_(self._sample_pos(prob=saliency, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
-                scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
-            else:
-                selected = np.random.choice(num_pixels, num_gaussians, replace=False, p=None)
-                xy.copy_(pixel_xy.detach().clone()[selected])
-                scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
-            # Feature
-            feat.copy_(self._get_target_features(gt_images=gt_images, positions=xy).detach().clone())
+        for i, gt_image in enumerate(gt_images):
+            xy, scale, feat = gsimage.xy[i], gsimage.scale[i], gsimage.feat[i]
+            pixel_xy = get_grid(h=img_h, w=img_w).to(dtype=xy.dtype, device=xy.device).reshape(-1, 2)
+            num_pixels = img_h * img_w
+            num_gaussians = xy.shape[0]
+            with torch.no_grad():
+                # Position.  # TODO: we need to initialize not right ON the gradient, but right next to it (so gradient of gradient)
+                if self.init_mode == 'gradient':
+                    gradients = self._compute_gmap(gt_image)
+                    g_norm = gradients.reshape(-1)
+                    gradients = g_norm / g_norm.sum()
+                    xy.copy_(self._sample_pos(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
+                    scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
+                elif self.init_mode == 'gradientnew':
+                    gradients = self._compute_gmap(gt_image)
+                    # gradients = (gradients + 1.2).clip(0., 1.)      # ensure low-density regions are not completely ignored
+                    g_norm = gradients.reshape(-1)
+                    gradients = g_norm / g_norm.sum()
+                    xy.copy_(self._sample_pos_new(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians, img_w=img_w, img_h=img_h))
+                    radii = self._get_radii(xy) * (img_h + img_w) / 2
+                    scale.copy_(radii if self.disable_inverse_scale else 1.0 / radii)
+                elif self.init_mode == "gradientpoisson":
+                    gradients = self._compute_gmap(gt_image)
+                    gradient_norm = (gradients - gradients.min()) / (gradients.max() - gradients.min())
+                    min_radius, max_radius = 0.5, 4.0                  # TODO: put in config
+                    radius_map = max_radius - (max_radius - min_radius) * gradient_norm
+                    # time it
+                    start_time = time()
+                    print("started sampler")
+                    nParticle, particleCoordinates = poissonDiskSampling(
+                        radius_map, 
+                        k=30,  # Number of candidates per iteration
+                        radiusType='default'
+                    )
+                    print(f"sampler took {time() - start_time:.2f} seconds, sampled {nParticle} points")
+                    print("done sampling")
+                    raise NotImplementedError()
+                    # xy.copy_(self._sample_pos(prob=gradients, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
+                elif self.init_mode == 'saliency':
+                    saliency = self._compute_smap(gt_image, path="models")
+                    xy.copy_(self._sample_pos(prob=saliency, pixel_xy=pixel_xy, num_pixels=num_pixels, num_gaussians=num_gaussians))
+                    scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
+                else:
+                    selected = np.random.choice(num_pixels, num_gaussians, replace=False, p=None)
+                    xy.copy_(pixel_xy.detach().clone()[selected])
+                    scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0 / self.init_scale)
+                # Feature
+                feat.copy_(self._get_target_features(gt_images=gt_image, positions=xy).detach().clone())
         return gsimage
     
     def _get_radii(self, xy, k_neighbours=5, overlap_factor=0.25):
@@ -501,7 +423,7 @@ class GaussianSplatting2D(nn.Module):
     # rendering function
     def forward(self, gsimage, tile_bounds=None, upsample_ratio=None, benchmark=False):
         xy, rot, scale, feat = gsimage.xy, gsimage.rot, gsimage.scale, gsimage.feat
-        img_h, img_w, feat_dim = gsimage.size[0].item(), gsimage.size[1].item(), gsimage.feat_dim
+        batsize, img_h, img_w, feat_dim = xy.shape[0], gsimage.size[0].item(), gsimage.size[1].item(), gsimage.feat_dim
         if tile_bounds is None:
             tile_bounds = ((img_w + self.block_w - 1) // self.block_w, (img_h + self.block_h - 1) // self.block_h, 1)
         scale = self._get_scale(scale=scale, upsample_ratio=upsample_ratio)
@@ -530,30 +452,6 @@ class GaussianSplatting2D(nn.Module):
         if upsample_ratio is not None:
             scale = upsample_ratio * scale
         return scale
-    
-    def apply_constraints(self, gsimage):
-        gsimage.xy.data.clamp_(-0.1, 1.1)
-        gsimage.scale.data.clamp_(0.1, 2)
-        gsimage.feat.data.clamp_(-1., 2.)
-        return gsimage
-    
-    def batched_forward_backward(self, gsimage, tile_bounds, images, num_streams=None):
-        streams = [torch.cuda.Stream() for _ in range(min(num_streams, len(images)))]
-        outputs = [None] * len(images)
-
-        _gsimage = gsimage
-
-        for i, image in enumerate(images):
-            stream = streams[i % num_streams]
-            gsimage = _gsimage[i]
-            with torch.cuda.stream(stream):
-                recons_images, _ = self.forward(gsimage, tile_bounds)       # (C, H, W), more or less in (0, 1)
-                total_loss, (l1_loss, l2_loss, ssim_loss) = self._get_total_loss(recons_images, images)
-                total_loss.backward()
-
-        # Wait for all to finish
-        torch.cuda.synchronize()
-        return outputs
 
     def optimize(self, images, total_num_gaussians=4000, target_psnr=40.0):     # (B, C, H, W), in range (0, 1)
         device = images.device
@@ -564,79 +462,65 @@ class GaussianSplatting2D(nn.Module):
         num_gaussians = math.ceil(self.initial_ratio * total_num_gaussians)
         max_add_num = math.ceil(float(total_num_gaussians-num_gaussians) / self.add_times)
 
+        psnr_curr, ssim_curr, best_psnr, best_ssim = 0.0, 0.0, 0.0, 0.0
+        decay_times, no_improvement_steps = 0, 0
+        render_time_accum, total_time_accum = 0.0, 0.0
+        lpips_final, flip_final, msssim_final = 1.0, 1.0, 0.0
 
         num_pixels = img_h * img_w
         tile_bounds = ((img_w + self.block_w - 1) // self.block_w, (img_h + self.block_h - 1) // self.block_h, 1)
 
         # initialize gaussian representations
-        gsimages = [GSImage(num_gaussians=num_gaussians, feat_dim=numchannels, size=(img_h, img_w), dtype=self.dtype, device=device) for _ in range(batsize)]
-        for image, gsimage in zip(images.unbind(0), gsimages):
-            self._init_pos_scale_feat(image, gsimage=gsimage)
-
-
-        best_psnr, best_ssim = [0.0] * len(gsimages), [0.0] * len(gsimages)
-        decay_times, no_improvement_steps = [0] * len(gsimages), [0] * len(gsimages)
-        # render_time_accum, total_time_accum = 0.0, 0.0
-        # lpips_final, flip_final, msssim_final = 1.0, 1.0, 0.0
+        gsimage = BatchedGSImage(batsize, num_gaussians=num_gaussians, feat_dim=numchannels, size=(img_h, img_w), dtype=self.dtype, device=device)
+        self._init_pos_scale_feat(gt_images=images, gsimage=gsimage)
 
         # create optimizer
-        optimizers = [torch.optim.Adam([{'params': gsimage.xy, 'lr': self.pos_lr},
+        optimizer = torch.optim.Adam([{'params': gsimage.xy, 'lr': self.pos_lr},
                                     {'params': gsimage.scale, 'lr': self.scale_lr},
                                     {'params': gsimage.rot, 'lr': self.rot_lr},
-                                    {'params': gsimage.feat, 'lr': self.feat_lr}]) for gsimage in gsimages]
+                                    {'params': gsimage.feat, 'lr': self.feat_lr}])
         
         went_beyond_min_steps = False
 
-        # streams = [torch.cuda.Stream() for _ in range(min(16, len(images)))]
-        outputs = [None] * len(gsimages)
-
         for step in range(self.start_step, self.max_steps+1):
-            for i, gsimage in enumerate(gsimages):
-                # stream = streams[i % len(streams)]
-                # with torch.cuda.stream(stream):
-                    optimizers[i].zero_grad()
-                    # Rendering
-                    recons_images, render_time = self.forward(gsimage, tile_bounds)       # (C, H, W), more or less in (0, 1)
-                    # # render_time_accum += render_time
-                    # # Optimization
-                    # # begin = perf_counter()
-                    total_loss, (l1_loss, l2_loss, ssim_loss) = self._get_total_loss(recons_images, images[i])
-                    total_loss.backward()
-                    optimizers[i].step()
-                    gsimage = self.apply_constraints(gsimage)
-            # total_time_accum += (perf_counter() - begin + render_time)
+            optimizer.zero_grad()
+            # Rendering
+            recons_images, render_time = self.forward(gsimage, tile_bounds)       # (C, H, W), more or less in (0, 1)
+            render_time_accum += render_time
+            # Optimization
+            begin = perf_counter()
+            total_loss, (l1_loss, l2_loss, ssim_loss) = self._get_total_loss(recons_images, images)
+            total_loss.backward()
+            optimizer.step()
+            total_time_accum += (perf_counter() - begin + render_time)
             # Logging
-            # torch.cuda.synchronize()
-            terminates = [False] * len(gsimages)
-            for i in range(len(gsimages)):
-                with torch.no_grad():
-                    num_gaussians = gsimages[i].xy.shape[0]
-                    if step % self.eval_steps == 0:
-                        if not self.disable_lr_schedule and num_gaussians == total_num_gaussians:
-                            psnr_curr, ssim_curr = self._evaluate(gsimages[i], images[i])
-                            terminate, (best_psnr_i, best_ssim_i, no_improvement_steps_i, decay_times_i) \
-                                = self._lr_schedule(psnr_curr, ssim_curr, best_psnr[i], best_ssim[i], no_improvement_steps[i], decay_times[i], optimizers[i])
-                            terminates[i], best_psnr[i], best_ssim[i], no_improvement_steps[i], decay_times[i] = terminate, best_psnr_i, best_ssim_i, no_improvement_steps_i, decay_times_i
-                            if psnr_curr >= target_psnr:
-                                terminates[i] = True
-                    if not self.disable_prog_optim and step % self.add_steps == 0 and num_gaussians < total_num_gaussians:
-                        add_num = min(max_add_num, total_num_gaussians-num_gaussians)
-                        gsimages[i] = self._add_gaussians(images[i], gsimages[i], tile_bounds, add_num)
+            terminate = False
+            with torch.no_grad():
+                num_gaussians = gsimage.xy.shape[0]
+                if step % self.eval_steps == 0:
+                    if not self.disable_lr_schedule and num_gaussians == total_num_gaussians:
+                        psnr_curr, ssim_curr = self._evaluate(gsimage, images)
+                        terminate, (best_psnr, best_ssim, no_improvement_steps, decay_times) \
+                            = self._lr_schedule(psnr_curr, ssim_curr, best_psnr, best_ssim, no_improvement_steps, decay_times, optimizer)
+                        if psnr_curr >= target_psnr:
+                            terminate = True
+                if not self.disable_prog_optim and step % self.add_steps == 0 and num_gaussians < total_num_gaussians:
+                    add_num = min(max_add_num, total_num_gaussians-num_gaussians)
+                    gsimage = self._add_gaussians(images, gsimage, tile_bounds, add_num)
 
-                        # Update optimizer
-                        optimizers[i] = torch.optim.Adam([{'params': gsimages[i].xy, 'lr': self.pos_lr},
-                                                        {'params': gsimages[i].scale, 'lr': self.scale_lr},
-                                                        {'params': gsimages[i].rot, 'lr': self.rot_lr},
-                                                        {'params': gsimages[i].feat, 'lr': self.feat_lr}])
-                    if step > self.min_steps and not went_beyond_min_steps:
-                        went_beyond_min_steps = True
-                        print("going beyond min steps")
-            if all(terminates) and step >= self.min_steps:
-                break
-        recons_images = [self.forward(gsimages[i])[0] for i in range(len(gsimages))]
-        ret = [self._evaluate(gsimages[i], images[i]) for i in range(len(gsimages))]
-
-        return gsimages, recons_images, ret
+                    # Update optimizer
+                    optimizer = torch.optim.Adam([{'params': gsimage.xy, 'lr': self.pos_lr},
+                                                    {'params': gsimage.scale, 'lr': self.scale_lr},
+                                                    {'params': gsimage.rot, 'lr': self.rot_lr},
+                                                    {'params': gsimage.feat, 'lr': self.feat_lr}])
+                if step > self.min_steps and not went_beyond_min_steps:
+                    went_beyond_min_steps = True
+                    print("going beyond min steps")
+                if terminate and step >= self.min_steps:
+                    break
+        recons_images = self.forward(gsimage)[0]
+        psnr_curr, ssim_curr = self._evaluate(gsimage, images)
+        return gsimage, recons_images, {"psnr": psnr_curr, "ssim": ssim_curr}
 
     def _get_total_loss(self, images, gt_images):
         total_loss = 0

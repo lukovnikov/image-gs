@@ -9,6 +9,57 @@ import torch
 
 import gsplat.cuda as _C
 
+
+import torch
+
+def project_gaussians_2d_scale_rot_batched(
+    means2d: torch.Tensor,       # [B, N, 2]
+    scales2d: torch.Tensor,      # [B, N, 2]
+    rotation: torch.Tensor,      # [B, N, 1]
+    img_height: int,
+    img_width: int,
+    tile_bounds: tuple[int, int, int],
+    n_streams: int = 8,
+):
+    """
+    Batched wrapper around project_gaussians_2d_scale_rot that uses multiple CUDA streams.
+    """
+    B = means2d.size(0)
+    outputs = [None] * B
+    streams = [torch.cuda.Stream() for _ in range(min(B, n_streams))]
+
+    for start in range(0, B, n_streams):
+        end = min(start + n_streams, B)
+        active_streams = streams[: end - start]
+
+        # Launch in parallel on separate CUDA streams
+        for i, stream in enumerate(active_streams):
+            b = start + i
+            with torch.cuda.stream(stream):
+                outputs[b] = project_gaussians_2d_scale_rot(
+                    means2d[b],
+                    scales2d[b],
+                    rotation[b],
+                    img_height,
+                    img_width,
+                    tile_bounds,
+                )
+
+        # Synchronize before moving to the next chunk
+        torch.cuda.synchronize()
+
+    # Unpack results (xys, radii, conics, num_tiles_hit)
+    xys, radii, conics, num_tiles_hit = zip(*outputs)
+    return (
+        torch.stack(xys),
+        torch.stack(radii),
+        torch.stack(conics),
+        torch.tensor(num_tiles_hit, device=means2d.device),
+    )
+
+
+
+
 def project_gaussians_2d_scale_rot(
     means2d: Float[Tensor, "*batch 2"],
     scales2d: Float[Tensor, "*batch 2"],

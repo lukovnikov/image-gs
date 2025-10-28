@@ -7,16 +7,16 @@ from pathlib import Path
 import yaml
 import fire
 # from model_light import GaussianSplatting2D
-from model_light_improved import GaussianSplatting2D, GSImage
+from model_light_improved import GaussianSplatting2D, GSImage, BatchedGSImage
 from utils.misc_utils import load_cfg
 from PIL import Image
 import json
 import tqdm
+import sys
 
 from torchvision import datasets, transforms
 from torchvision.transforms.functional import to_pil_image
-from torch.utils.data import DataLoader
-
+from torch.utils.data import DataLoader, Dataset
 
 
 def get_gaussian_cfg(args):
@@ -99,13 +99,13 @@ def encode_directory(path="../miniimagenet_256/",
                      start_idx=0,
                      end_idx=-1,
                      config="cfgs/default_improved.yaml",
-                     outdir="miniimagenet_256_out",
+                     outdir="miniimagenet_256_out_batched",
                      num_gaussians=4000,
                      min_steps=700,
                      max_steps=5000,
                      target_psnr=32,
                      imsize=256,
-                     batsize=1,
+                     batsize=2,
                      numworkers=4,
                      save=True,
                      overwrite=False,
@@ -177,10 +177,100 @@ def encode_directory(path="../miniimagenet_256/",
     print("done iterating")
 
 
+class GSDataset(Dataset):
+    def __init__(self, path="miniimagenet_256_out/num-4000_psnr-32/gs", num_examples=-1):
+        self.path = Path(path)
+        self.files = list(self.path.glob("*.pt"))
+        print(f"Found {len(self.files)} files in {self.path}")
+        if num_examples > 0:
+            self.files = self.files[:num_examples]
+        print(f"Using {len(self.files)} files")
 
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        file_path = self.files[idx]
+        gsimage = GSImage.from_statedict(torch.load(file_path))
+        return gsimage
+    
+    @staticmethod
+    def collate_fn(batch):
+        gsimages = batch
+        batchedgsimage = BatchedGSImage.from_gsimages(gsimages)
+        batch = batchedgsimage
+        return batch
+    
+
+def load_gs(
+        path="miniimagenet_256_out/num-4000_psnr-32/gs",
+        batch_size=20,
+        num_workers=4,
+        num_examples=-1,
+        gsconfig="cfgs/default_improved.yaml",
+    ):
+    ds = GSDataset(path=path, num_examples=num_examples)
+    dl = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, collate_fn=GSDataset.collate_fn)
+    
+    with open(gsconfig, "r", encoding='utf-8') as file:
+        cfg: dict = yaml.safe_load(file)
+        cfg["min_steps"] = 5000
+        cfg["max_steps"] = 10000
+        cfg = SimpleNamespace(**cfg)
+
+    imagegs = GaussianSplatting2D(cfg)
+
+    xy_stats = [0, 0, 0, 0]
+    scale_stats = [0, 0, 0, 0]
+    rot_stats = [0, 0]
+    feat_stats = [0, 0, 0, 0, 0, 0]
+
+    # (inverse) scale should be between 0.1 (pretty large and clipped) and 20 (invisible at 256 res)
+    # we shouldn't allow too large scales
+    # rotation can be between 0 and pi
+    # xy 
+
+    for batch in tqdm.tqdm(dl):
+        gs = batch
+        gs.rot.data = gs.rot.data % torch.pi
+        gs.scale.data = gs.scale.data.abs()
+        xy_stats = [min(xy_stats[0], gs.xy[..., 0].min().item()), 
+                    max(xy_stats[1], gs.xy[..., 0].max().item()),
+                    min(xy_stats[2], gs.xy[..., 1].min().item()), 
+                    max(xy_stats[3], gs.xy[..., 1].max().item()),
+                    ]
+        scale_stats = [min(scale_stats[0], (1/gs.scale[..., 0]).min().item()),
+                       max(scale_stats[1], (1/gs.scale[..., 0]).max().item()),
+                       min(scale_stats[2], (1/gs.scale[..., 1]).min().item()),
+                       max(scale_stats[3], (1/gs.scale[..., 1]).max().item()),
+                       ]
+        rot_stats = [min(rot_stats[0], gs.rot.min().item()), 
+                     max(rot_stats[1], gs.rot.max().item())]
+        
+        feat_stats = [min(feat_stats[0], gs.feat[..., 0].min().item()),
+                      max(feat_stats[1], gs.feat[..., 0].max().item()),
+                      min(feat_stats[2], gs.feat[..., 1].min().item()),
+                      max(feat_stats[3], gs.feat[..., 1].max().item()),
+                      min(feat_stats[4], gs.feat[..., 2].min().item()),
+                      max(feat_stats[5], gs.feat[..., 2].max().item()),
+                      ]
+        x = gs.pack()
+        # print(gs)
+
+    print("xy stats:", xy_stats)
+    print("scale stats:", scale_stats)
+    print("rot stats:", rot_stats)  
+    print("feat stats:", feat_stats)
 
 if __name__ == "__main__":
-    fire.Fire(encode_directory)
+    if len(sys.argv) == 1:
+        load_gs()
+    else:
+        fire.Fire({
+            "encode_dir": encode_directory,
+            "load_gs": load_gs,
+        })
+    # fire.Fire(encode_directory)
     # torch.hub.set_dir("models/torch")
     # parser = argparse.ArgumentParser()
     # parser = load_cfg(cfg_path="cfgs/default.yaml", parser=parser)

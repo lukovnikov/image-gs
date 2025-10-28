@@ -1,6 +1,6 @@
 from typing import Any
 import torch
-from .project_gaussians_2d_scale_rot import project_gaussians_2d_scale_rot
+from .project_gaussians_2d_scale_rot import project_gaussians_2d_scale_rot, project_gaussians_2d_scale_rot_batched
 from .rasterize_sum import rasterize_gaussians_sum
 from .rasterize_no_tiles import rasterize_gaussians_no_tiles, rasterize_gaussians_simple
 from .utils import (
@@ -15,6 +15,7 @@ import warnings
 
 __all__ = [
     "project_gaussians_2d_scale_rot",
+    "project_gaussians_2d_scale_rot_batched",
     "rasterize_gaussians_sum",
     "rasterize_gaussians_no_tiles",
     # utils
